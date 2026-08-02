@@ -5,9 +5,12 @@
 ## 1. Introduction
 This Functional Requirements Document (FRD) defines the specific application actions, warning popups, recycle bins, notifications, and analytics screens required to implement the Shea Post Acute scheduling system.
 
+The application is engineered as a responsive PWA, exposing wrapper shells using Capacitor (mobile Android/iOS) and Tauri (desktop native packages) in later phases without altering the underlying React architecture.
+
 ---
 
 ## 2. User Roles & Access
+* **Roster vs Account Isolation**: Schedulers manage a physical list of `staff_members` (including floor shadow hosts, preceptors, and float staff). Authentication user accounts (`user_accounts`) reference these roster entries, ensuring only staff with scheduling, check-in, or manager duties require credentials.
 * **Individual Accounts & Registration**: Accessing the application requires individual email/password auth. Schedulers/Admins invite new staff by entering their email on the Roster screen, which sends an automated email invitation. The link redirects users to set up their password and 4-digit PIN.
   * **Link Expirations**: Registration links contain a unique token associated with a database timestamp. Clicking links older than **7 days** redirects to an "Invitation Expired" error screen.
   * **Password Reset Links**: Outbound email links for password recovery remain active for **24 hours** from generation before invalidating. Clicks redirect directly to a customized password modification route (`/reset-password`) inside the PWA client application wrapper to maintain the app's premium dark glassmorphism styling. Custom template translations and dispatches are managed globally within the Supabase Developer Console.
@@ -15,9 +18,12 @@ This Functional Requirements Document (FRD) defines the specific application act
   * **Reset Auth Redirects**: If a user visits the `/reset-password` path directly without a valid Supabase recovery hash or active auth session, the app redirects them immediately to the `/login` screen showing an inline warning: `"Unauthorized: Password resets require a valid recovery token."`
   * **Reset Hash Session Expirations**: If a user reloads the `/reset-password` screen or navigates away, the recovery token inside the URL hash is discarded by the browser, expiring the session token. Any subsequent attempts to save a password without requesting a fresh forgot password link are blocked.
 * **Identity Dropdown**: Users select their active profile name from a main header dropdown.
-* **4-Digit Transaction PIN**: Any scheduling insert, edit, delete, or recovery action requires entering their personal 4-digit PIN.
-  * **Session PIN Caching**: To prevent repetitive typing during busy scheduling blocks, the system caches the PIN locally in memory for **5 minutes** from the last validated action. If 5 minutes pass without a transaction, the session expires and re-entry is required.
-* **Supreme Override User**: A file-based configuration profile checks if the selected identity is listed as a "Supreme User" in the server's `app_config.json`. If so, the user is authorized to perform hard-deletions in the "Oh Sh!t" recycle bin.
+* **4-Digit Transaction PIN (Hardened)**: Any scheduling insert, edit, delete, or recovery action requires entering their personal 4-digit PIN.
+  * **Server Hashing Verification**: The PIN is never stored as plain text. The application hashes the PIN and verifies it using a secure PostgreSQL RPC function `verify_profile_pin(profile_id UUID, input_pin VARCHAR(4))` on the Supabase database server.
+  * **Lockout Rate Limiting**: If verification fails, the database increments `pin_failure_count` in the `user_accounts` table. If failures reach **5 consecutive attempts**, the database sets `last_pin_failure_at = now()` and blocks all verification queries for that user for **15 minutes**. Row-Level Security (RLS) policies prevent users from selecting another user's pin hash.
+  * **Session PIN Caching**: To prevent repetitive typing during busy scheduling blocks, the system caches the PIN locally in memory for **5 minutes** from the last validated action. If 5 minutes pass without a transaction, the session expires and re-entry is required. Write operations verify identity via the authenticated Supabase session ID.
+* **Shared-Device Local Application Lock**: While Supabase Auth tokens persist for 30 days to avoid password fatigue, the PWA client interface automatically locks after **15 minutes** of inactivity, browser backgrounding, or device sleep. Re-entry requires the current active user to input their 4-digit transaction PIN to unlock. PIN codes are stored in volatile memory and are cleared on user switches or logouts.
+* **Supreme Override User**: Check if the user account is mapped to the `system_admin` role. If so, the user is authorized to perform hard-deletions in the Recovery Center.
 * **Seeded Administrator**: Upon deployment, a root admin account is seeded with a temporary password (`ChangeMePlease!2026` for `admin@sheapostacute.com`). This allows the facility to log in immediately and begin sending registrations to managers.
 * **30-Day Session Persistence**: User sessions remain active for **30 days** on local browsers before requiring password re-entry. This minimizes floor friction, relying on the 5-minute transaction PIN cache for data changes.
 * **Notification Mute Toggle**: Users toggle a `Mute Notification Sounds` checkbox in their Profile Settings drawer. When enabled (`mute_notifications = true` in profiles), the client-side audio engine bypasses ready chimes to prevent disruptions during presentations.
@@ -80,7 +86,7 @@ This Functional Requirements Document (FRD) defines the specific application act
   * **Implementation**: The sound is generated dynamically using the browser's native **Web Audio API** (using a sine-wave oscillator sweeping from 880Hz to 440Hz over 0.5 seconds, mimicking a soft-bell strike). This runs 100% offline without needing external media resources.
   * The system sends an **additional** urgent SMS to the interviewer (if SMS is enabled):
     * *"[URGENT] Walk-in is ready! [Candidate Name] ([Position]) is done with paperwork and waiting in the lobby."*
-  * **PWA Web Push alerts**: The PWA immediately prompts the user for native browser Web Push permissions upon first login dashboard page load. If granted, the service worker registers push subscription tokens to trigger native lockscreen warnings when browser tabs are in background slots.
+  * **PWA Web Push Notification Prompts**: The app displays an `"Enable Alerts"` banner on the dashboard layout. Clicking the banner prompts the browser's native notification access dialog (adhering to iOS user-initiated action requirements). If granted, registers push subscriptions to dispatch lockscreen alerts when the browser is closed.
 
 ### 3.4. Multi-Stage Candidate Pipeline (ATS)
 The application tracks candidate progress through five stages:
@@ -128,7 +134,7 @@ The application tracks candidate progress through five stages:
    * Schedulers input the candidate's planned work schedule.
 
 ### 3.5. Hiring Needs Auto-Triangulation
-* **Cumulative Target Monitoring**: The hiring needs tracker monitors targets as a simple cumulative headcount target per role/shift (e.g. Day Shift CNA target is 4) rather than splitting targets by individual days of the week. No target change audit records are logged.
+* **FTE Quota Math**: Staffing quotas track required Full-Time Equivalents (FTE) instead of simple vacancy headcounts, mapping coverage requirements dynamically.
 * **Predictive Candidate Metrics**: The hiring needs panel tracks and overlays active pipeline applicant volumes, displaying count statistics representing candidates currently in active states:
   * **Active States**: Candidate `pipeline_stage` matching `First_Interview`, `Shadow_Shift`, `Final_Interview`, or `Training`. Candidates in Employed, Rejected, or Withdrawn stages are excluded.
   * **Zero Count Hidden**: If the active candidate count for a role/shift is 0, the predictive counter text appender is hidden completely to prevent screen clutter.
@@ -147,11 +153,13 @@ The application tracks candidate progress through five stages:
 * The dashboard grid calendar default view focuses on the current week.
 * **No Navigation Caps**: Schedulers can navigate forward in time indefinitely using next/previous arrow controls at the top of the grid, allowing bookings to be planned weeks or months in advance.
 
-### 3.7. Network Connectivity Checks & Offline Warnings
+### 3.7. Network Connectivity Checks & Offline-Capable Read-Only Safety Mode
 * The application runs checks using the browser's `navigator.onLine` state.
-* **Offline Detection**: If the internet connection drops:
-  * A persistent red banner displays at the top of the app screen: `"Offline Mode: No Internet Connection. Scheduling updates are disabled."`
-  * All editing forms, status toggles, check-in buttons, and recovery actions are disabled to prevent local conflict errors.
+* **Offline Detection & Safety Mode**: If the internet connection drops:
+  * A persistent red banner displays at the top of the app screen: `"Offline Mode: Scheduling updates are disabled."`
+  * The app caches the static app shell, stylesheet, compiled JS, and icons. Supabase candidate records/databases are *not* cached indiscriminately.
+  * Displays the last safely loaded screen data with a stale data warning disclaimer.
+  * Disables all editing forms, status toggles, check-in buttons, and recovery actions to prevent local sync conflicts.
 
 ### 3.8. Security, Login & 2FA Recovery
 * **Secure Login**: Accessing the app requires individual email/password auth.
@@ -159,16 +167,17 @@ The application tracks candidate progress through five stages:
 * **Self-Service Password Reset**: Users click "Forgot Password". Supabase Auth emails a secure link to reset their credentials.
 * **Self-Service PIN Reset**: Users click "Reset PIN". The system emails a 6-digit OTP code. Entering the code redirects to a screen to set a new transaction PIN.
 
-### 3.9. "Oh Sh!t" Recycle Bin Module
+### 3.9. Recovery Center (Oh Sh!t Bin)
 * Deleting bookings, staff profiles, candidates, shadow hosts, or exceptions triggers a soft-delete (`is_deleted = true`), updating `deleted_at = now()` and `deleted_by = [active name dropdown selection]`.
-* **Default Deletion Sorting**: Soft-deleted records are automatically sorted in the Recycle Bin grid by deletion date (most recently soft-deleted first, i.e., `deleted_at DESC`).
-* **Open Access Viewing & Filtering**: Any logged-in user can navigate to the "Oh Sh!t" bin, view all soft-deleted records (including who deleted them), search by candidate or staff name using a search bar, and click the "Recover" button. Dropping down or filtering searches by deletion author is not supported. Stored recovery events (`recovered_by`, `recovered_at`) are saved inside database audit columns only.
-* **Cascading recovery**: Restoring a candidate from the Recycle Bin triggers a database function that automatically cascading-undeletes all associated child records (bookings, shadow shifts, training orientation days) that were soft-deleted with the candidate.
-  * **Undelete filter**: Relational cascading-recoveries only restore child rows that were soft-deleted at the same time as the parent candidate (where child `deleted_at` matches parent `deleted_at` within a 1-second margin). Cancelled or historical child soft-deletes remain deleted.
+* **Deletion Batch UUID**: Every cascading soft-delete operation stamps a unique `deletion_batch_id` across parent profiles and all child records (interviews, shadow shifts, orientation dates).
+* **Default Deletion Sorting**: Soft-deleted records are automatically sorted in the Recovery Center grid by deletion date (most recently soft-deleted first, i.e., `deleted_at DESC`).
+* **Open Access Viewing & Filtering**: Any logged-in user can navigate to the Recovery Center, view all soft-deleted records (including who deleted them), search by candidate or staff name using a search bar, and click the "Recover" button. Dropping down or filtering searches by deletion author is not supported. Stored recovery events (`recovered_by`, `recovered_at`) are saved inside database audit columns only.
+* **Cascading recovery**: Restoring a candidate from the Recovery Center triggers a database function that automatically cascading-undeletes all associated child records sharing the same `deletion_batch_id`.
+  * **Undelete filter**: Relational cascading-recoveries only restore child rows that match the parent's `deletion_batch_id`. Cancelled or historical child soft-deletes remain deleted.
   * **Audits copy**: Relational cascading-recoveries automatically copy the parent's `recovered_by` and `recovered_at` details onto all restored child rows, ensuring precise audit tracking on every row.
   * **Confirmation Popup**: Completing a cascading recovery pops up a success confirmation dialog to the scheduler: `"Success: [Candidate Name] and [X] associated child records restored."` summarizing the operation. Users must click a Close button (or click the background overlay) to dismiss the popup; auto-timeout dismissals are not executed. A stylized green checkmark circle icon renders alongside the success summary.
 * **Single-Item PIN-Restricted Recovery**: Recovery operations must be performed **one item at a time**. Clicking "Recover" prompts the user to enter their 4-digit transaction PIN (subject to the 5-minute cache), logging `recovered_at` and `recovered_by`. Bulk checkbox recovery is not supported.
-* **Hard Purges Restricted**: Clicking "Delete Permanently" is greyed out unless the logged-in user is listed as a Supreme User in `app_config.json`.
+* **Hard Purges Restricted**: Clicking "Delete Permanently" is greyed out unless the logged-in user is mapped to the `system_admin` role.
   * **Lock Hover Tooltip**: When non-supreme users hover over the disabled "Delete Permanently" buttons, the system displays a tooltip: `"Permanent deletions are locked. Please contact a Supreme User to request a hard purge."`
 * **Automated pg_cron Purging**: A daily database trigger scheduled via Supabase automates final hard-purges on soft-deleted rows where `deleted_at < NOW() - INTERVAL '90 days'`.
 
